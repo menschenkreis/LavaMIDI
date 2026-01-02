@@ -344,6 +344,7 @@ class AppState:
     motion_mode: str = MotionMode.OPTICAL_FLOW.value
     track_color_hsv: Tuple[int, int, int] = (15, 200, 200)
     motion_smoothing: float = 0.3
+    motion_gain: float = 1.0  # NEW: Amplify motion/flow vectors
     video_source_type: str = "camera"
     video_file_path: str = ""
     log_midi_signals: bool = False
@@ -449,8 +450,13 @@ class VideoProcessor(threading.Thread):
                     with self._lock:
                         if self.cap:
                             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                time.sleep(0.01)
-                continue
+                            ret, frame = self.cap.read()
+                            if not ret:
+                                time.sleep(0.01)
+                                continue
+                else:
+                    time.sleep(0.01)
+                    continue
             
             frame = cv2.flip(frame, 1)
             
@@ -1724,9 +1730,19 @@ class LavaMIDIApp(ctk.CTk):
                                               self.app_state.motion_mode,
                                               command=lambda v: setattr(self.app_state, 'motion_mode', v))
         self.motion_dropdown.pack(fill="x", pady=(0, 6))
-        self.sens_slider = ModernSlider(motion.content, "Sensitivity", 1, 100,
+        
+        # Extended sensitivity range (1-200) for finer control at high values
+        self.sens_slider = ModernSlider(motion.content, "Sensitivity", 1, 200,
                                         self.app_state.sensitivity, self._on_sensitivity_change)
         self.sens_slider.pack(fill="x", pady=(0, 6))
+        
+        # NEW: Motion gain/amplification control
+        self.gain_slider = ModernSlider(motion.content, "Motion Gain", 0.5, 5.0,
+                                        self.app_state.motion_gain,
+                                        lambda v: setattr(self.app_state, 'motion_gain', v),
+                                        format_str="{:.1f}x")
+        self.gain_slider.pack(fill="x", pady=(0, 6))
+        
         self.smooth_slider = ModernSlider(motion.content, "Smoothing", 0, 0.9,
                                           self.app_state.motion_smoothing,
                                           lambda v: setattr(self.app_state, 'motion_smoothing', v),
@@ -2220,6 +2236,7 @@ class LavaMIDIApp(ctk.CTk):
             self.grid_h_slider.set(self.app_state.grid_h)
             self.motion_dropdown.set(self.app_state.motion_mode)
             self.sens_slider.set(self.app_state.sensitivity)
+            self.gain_slider.set(self.app_state.motion_gain)
             self.smooth_slider.set(self.app_state.motion_smoothing)
             self.analysis_slider.set(self.app_state.analysis_width)
             self.vel_min_slider.set(self.app_state.min_velocity)
@@ -2311,7 +2328,9 @@ class LavaMIDIApp(ctk.CTk):
         return SCALES.get(s_name, SCALES["Minor Pentatonic"])
 
     def _get_threshold(self):
-        return (101 - self.app_state.sensitivity) / 100.0 * 8.0
+        # Extended range: 1-200, with finer control at high sensitivity
+        # At sens=100: threshold=0.08, at sens=200: threshold≈0
+        return (201 - self.app_state.sensitivity) / 200.0 * 8.0
 
     def _process_drones(self, now):
         if not self.app_state.midi_active:
@@ -2390,6 +2409,10 @@ class LavaMIDIApp(ctk.CTk):
 
         frame = result['frame']
         global_speeds = result['speeds']
+        
+        # Apply motion gain/amplification
+        if global_speeds is not None:
+            global_speeds = global_speeds * self.app_state.motion_gain
         
         self.last_frame_bgr = frame.copy()
         tw, th = max(10, self.video_label.winfo_width()), max(10, self.video_label.winfo_height())
@@ -2535,7 +2558,7 @@ class LavaMIDIApp(ctk.CTk):
                                 0.32, (255, 255, 255), 1, cv2.LINE_AA)
 
         if self.app_state.show_flow_vectors:
-            self.analyzer.draw_flow_vectors(overlay)
+            self.analyzer.draw_flow_vectors(overlay, scale=3.0 * self.app_state.motion_gain)
 
         if self.app_state.show_grid and not self.app_state.pixelate_view:
             for i in range(1, self.app_state.grid_w):
