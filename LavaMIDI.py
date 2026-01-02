@@ -71,19 +71,36 @@ FRAME_QUEUE_SIZE = 2  # Small queue to avoid latency buildup
 # ══════════════════════════════════════════════════════════════════════════════
 
 @jit(nopython=True, cache=True)
-def process_visual_ramp(vis_current: np.ndarray, vis_target: np.ndarray, 
-                        ramp_speed: float) -> np.ndarray:
-    """JIT-compiled visual ramp interpolation."""
+def ease_in_out_quad(t: float) -> float:
+    """Quadratic ease-in-out: smooth acceleration and deceleration."""
+    if t < 0.5:
+        return 2.0 * t * t
+    else:
+        return 1.0 - ((-2.0 * t + 2.0) ** 2) / 2.0
+
+
+@jit(nopython=True, cache=True)
+def process_visual_easing(vis_current: np.ndarray, vis_from: np.ndarray, 
+                          vis_to: np.ndarray, vis_start_times: np.ndarray,
+                          now: float, ramp_duration: float) -> np.ndarray:
+    """JIT-compiled eased visual interpolation."""
     h, w = vis_current.shape
     result = vis_current.copy()
     for y in range(h):
         for x in range(w):
-            current = result[y, x]
-            target = vis_target[y, x]
-            if current < target:
-                result[y, x] = min(target, current + ramp_speed)
-            elif current > target:
-                result[y, x] = max(target, current - ramp_speed)
+            start_time = vis_start_times[y, x]
+            if start_time > 0:
+                elapsed = now - start_time
+                if elapsed >= ramp_duration:
+                    # Animation complete
+                    result[y, x] = vis_to[y, x]
+                else:
+                    # Calculate eased progress
+                    progress = elapsed / ramp_duration
+                    eased = ease_in_out_quad(progress)
+                    from_val = vis_from[y, x]
+                    to_val = vis_to[y, x]
+                    result[y, x] = from_val + (to_val - from_val) * eased
     return result
 
 
@@ -1585,9 +1602,20 @@ class LavaMIDIApp(ctk.CTk):
         self.vis_current_vals = np.zeros((self.app_state.grid_h, self.app_state.grid_w))
         self.vis_target_vals = np.zeros((self.app_state.grid_h, self.app_state.grid_w))
         self.cooldown_matrix = np.full((self.app_state.grid_h, self.app_state.grid_w), COOLDOWN_TIME)
+        
+        # Easing animation buffers
+        self.vis_anim_start_times = np.zeros((self.app_state.grid_h, self.app_state.grid_w))
+        self.vis_anim_from = np.zeros((self.app_state.grid_h, self.app_state.grid_w))
+        self.vis_anim_to = np.zeros((self.app_state.grid_h, self.app_state.grid_w))
+        
+        # Initialize zone cells with base alpha
+        for (x, y), zone in self.cell_map.items():
+            if y < self.app_state.grid_h and x < self.app_state.grid_w:
+                self.vis_current_vals[y, x] = ZONE_ALPHA
+                self.vis_anim_to[y, x] = ZONE_ALPHA
 
     def _init_video_thread(self):
-        """OPTIMIZATION: Initialize and start the video processing thread."""
+        """OPTIMIZATION: Initialize the video processing thread (but don't start capture yet)."""
         self.video_processor = VideoProcessor(
             self.app_state, 
             self.frame_queue, 
@@ -1595,12 +1623,9 @@ class LavaMIDIApp(ctk.CTk):
             self._log
         )
         self.video_processor.set_analyzer(self.analyzer)
-        self.video_processor.init_video(
-            self.app_state.video_source_type,
-            self.app_state.video_file_path
-        )
+        # Don't auto-start video capture - wait for user to click camera/file button
         self.video_processor.start()
-        self._log("Video thread started", "success")
+        self._log("Ready - click 📷 or 📁 to start video", "info")
         if NUMBA_AVAILABLE:
             self._log("Numba JIT enabled", "success")
         else:
@@ -1687,6 +1712,47 @@ class LavaMIDIApp(ctk.CTk):
                       height=24, font=("Inter", 10),
                       command=lambda: self._load_settings(None)).pack(side="left", expand=True, fill="x", padx=(2, 0))
 
+        # VIDEO SECTION - expanded by default, right after Project
+        video = CollapsibleSection(sidebar, "Video", expanded=True)
+        video.pack(fill="x", padx=8, pady=(0, 6))
+
+        src_row = ctk.CTkFrame(video.content, fg_color="transparent")
+        src_row.pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(src_row, text="📷 Webcam", fg_color=Theme.BG_INPUT, hover_color=Theme.BG_HOVER,
+                      height=28, font=("Inter", 10), command=self._set_camera).pack(side="left", expand=True, fill="x", padx=(0, 2))
+        ctk.CTkButton(src_row, text="📁 File", fg_color=Theme.BG_INPUT, hover_color=Theme.BG_HOVER,
+                      height=28, font=("Inter", 10), command=self._set_file).pack(side="left", expand=True, fill="x", padx=(2, 0))
+
+        self.bright_slider = ModernSlider(video.content, "Brightness", -100, 100, 0,
+                                          lambda v: setattr(self.app_state, 'brightness', v))
+        self.bright_slider.pack(fill="x", pady=(0, 6))
+        self.contrast_slider = ModernSlider(video.content, "Contrast", 0.5, 3.0, 1.0,
+                                            lambda v: setattr(self.app_state, 'contrast', v), format_str="{:.1f}")
+        self.contrast_slider.pack(fill="x", pady=(0, 6))
+        self.blur_slider = ModernSlider(video.content, "Blur", 0, 50, self.app_state.video_blur_amount,
+                                        lambda v: setattr(self.app_state, 'video_blur_amount', int(v)))
+        self.blur_slider.pack(fill="x", pady=(0, 6))
+
+        toggle_row = ctk.CTkFrame(video.content, fg_color="transparent")
+        toggle_row.pack(fill="x")
+        self.grid_switch = ctk.CTkSwitch(toggle_row, text="Grid", font=("Inter", 10), width=40,
+                                         command=lambda: setattr(self.app_state, 'show_grid', self.grid_switch.get()))
+        self.grid_switch.select()
+        self.grid_switch.pack(side="left")
+        self.notes_switch = ctk.CTkSwitch(toggle_row, text="Notes", font=("Inter", 10), width=40,
+                                          command=lambda: setattr(self.app_state, 'show_notes', self.notes_switch.get()))
+        self.notes_switch.select()
+        self.notes_switch.pack(side="left", padx=(8, 0))
+
+        toggle_row2 = ctk.CTkFrame(video.content, fg_color="transparent")
+        toggle_row2.pack(fill="x", pady=(4, 0))
+        self.pixelate_switch = ctk.CTkSwitch(toggle_row2, text="Pixelate", font=("Inter", 10), width=40,
+                                             command=lambda: setattr(self.app_state, 'pixelate_view', self.pixelate_switch.get()))
+        self.pixelate_switch.pack(side="left")
+        self.flow_switch = ctk.CTkSwitch(toggle_row2, text="Flow", font=("Inter", 10), width=40,
+                                         command=lambda: setattr(self.app_state, 'show_flow_vectors', self.flow_switch.get()))
+        self.flow_switch.pack(side="left", padx=(8, 0))
+
         # Music
         music = CollapsibleSection(sidebar, "Music", expanded=False)
         music.pack(fill="x", padx=8, pady=(0, 6))
@@ -1769,47 +1835,6 @@ class LavaMIDIApp(ctk.CTk):
                                              self.app_state.velocity_curve,
                                              command=lambda v: setattr(self.app_state, 'velocity_curve', v))
         self.curve_dropdown.pack(fill="x")
-
-        # Video
-        video = CollapsibleSection(sidebar, "Video", expanded=False)
-        video.pack(fill="x", padx=8, pady=(0, 6))
-
-        src_row = ctk.CTkFrame(video.content, fg_color="transparent")
-        src_row.pack(fill="x", pady=(0, 6))
-        ctk.CTkButton(src_row, text="📷", fg_color=Theme.BG_INPUT, hover_color=Theme.BG_HOVER,
-                      height=24, width=40, command=self._set_camera).pack(side="left", expand=True, fill="x", padx=(0, 2))
-        ctk.CTkButton(src_row, text="📁", fg_color=Theme.BG_INPUT, hover_color=Theme.BG_HOVER,
-                      height=24, width=40, command=self._set_file).pack(side="left", expand=True, fill="x", padx=(2, 0))
-
-        self.bright_slider = ModernSlider(video.content, "Brightness", -100, 100, 0,
-                                          lambda v: setattr(self.app_state, 'brightness', v))
-        self.bright_slider.pack(fill="x", pady=(0, 6))
-        self.contrast_slider = ModernSlider(video.content, "Contrast", 0.5, 3.0, 1.0,
-                                            lambda v: setattr(self.app_state, 'contrast', v), format_str="{:.1f}")
-        self.contrast_slider.pack(fill="x", pady=(0, 6))
-        self.blur_slider = ModernSlider(video.content, "Blur", 0, 50, self.app_state.video_blur_amount,
-                                        lambda v: setattr(self.app_state, 'video_blur_amount', int(v)))
-        self.blur_slider.pack(fill="x", pady=(0, 6))
-
-        toggle_row = ctk.CTkFrame(video.content, fg_color="transparent")
-        toggle_row.pack(fill="x")
-        self.grid_switch = ctk.CTkSwitch(toggle_row, text="Grid", font=("Inter", 10), width=40,
-                                         command=lambda: setattr(self.app_state, 'show_grid', self.grid_switch.get()))
-        self.grid_switch.select()
-        self.grid_switch.pack(side="left")
-        self.notes_switch = ctk.CTkSwitch(toggle_row, text="Notes", font=("Inter", 10), width=40,
-                                          command=lambda: setattr(self.app_state, 'show_notes', self.notes_switch.get()))
-        self.notes_switch.select()
-        self.notes_switch.pack(side="left", padx=(8, 0))
-
-        toggle_row2 = ctk.CTkFrame(video.content, fg_color="transparent")
-        toggle_row2.pack(fill="x", pady=(4, 0))
-        self.pixelate_switch = ctk.CTkSwitch(toggle_row2, text="Pixelate", font=("Inter", 10), width=40,
-                                             command=lambda: setattr(self.app_state, 'pixelate_view', self.pixelate_switch.get()))
-        self.pixelate_switch.pack(side="left")
-        self.flow_switch = ctk.CTkSwitch(toggle_row2, text="Flow", font=("Inter", 10), width=40,
-                                         command=lambda: setattr(self.app_state, 'show_flow_vectors', self.flow_switch.get()))
-        self.flow_switch.pack(side="left", padx=(8, 0))
 
     def _build_midi_section(self):
         section = self.midi_section
@@ -2060,7 +2085,7 @@ class LavaMIDIApp(ctk.CTk):
                 pitch = self.pitch_calc.calculate(gx, gy, self._get_root_midi(zone),
                                                   self._get_scale(zone), self.app_state.mapping_direction, 0)
                 pitch = self._wrap_pitch_to_range(pitch, zone)
-                self.vis_target_vals[gy, gx] = 1.0
+                self._start_cell_anim(gx, gy, 1.0, time.time())
                 self.midi.send_note_on(pitch, self.app_state.manual_trigger_velocity, zone.channel - 1)
                 if self.app_state.log_midi_signals:
                     self._log(f"⚡ {zone.name} Note {pitch}", "midi")
@@ -2072,7 +2097,7 @@ class LavaMIDIApp(ctk.CTk):
         self.drag_cells = self._calc_selection()
 
     def _manual_reset(self, x, y):
-        self.vis_target_vals[y, x] = 0.0
+        self._start_cell_anim(x, y, ZONE_ALPHA if (x, y) in self.cell_map else 0.0, time.time())
 
     def _on_mouse_drag(self, event):
         if self.picking_zone or self.app_state.manual_trigger_mode:
@@ -2101,6 +2126,13 @@ class LavaMIDIApp(ctk.CTk):
 
     def _rebuild_cell_map(self):
         self.cell_map = {cell: z for z in self.zones for cell in z.cells}
+        # Update visual values for zone cells
+        now = time.time()
+        for (x, y), zone in self.cell_map.items():
+            if y < self.app_state.grid_h and x < self.app_state.grid_w:
+                # Start animation to ZONE_ALPHA for new zone cells
+                if self.vis_current_vals[y, x] < ZONE_ALPHA:
+                    self._start_cell_anim(x, y, ZONE_ALPHA, now)
 
     def _set_zone_cells(self, zone: Zone, widget: CollapsibleZoneCard):
         if not self.selected_cells:
@@ -2332,6 +2364,43 @@ class LavaMIDIApp(ctk.CTk):
         # At sens=100: threshold=0.08, at sens=200: threshold≈0
         return (201 - self.app_state.sensitivity) / 200.0 * 8.0
 
+    def _start_cell_anim(self, x: int, y: int, target: float, now: float):
+        """Start an eased animation for a cell if target changed."""
+        current_target = self.vis_anim_to[y, x]
+        # Only start new animation if target actually changed (with small epsilon)
+        if abs(target - current_target) > 0.01:
+            self.vis_anim_from[y, x] = self.vis_current_vals[y, x]
+            self.vis_anim_to[y, x] = target
+            # Start slightly in the past so first frame shows ~20% progress (immediate feedback)
+            self.vis_anim_start_times[y, x] = now - (VISUAL_RAMP_TIME * 0.2)
+
+    def _update_cell_anim(self, x: int, y: int, now: float):
+        """Update cell animation with ease-in-out interpolation."""
+        start_time = self.vis_anim_start_times[y, x]
+        
+        # No animation running
+        if start_time <= 0:
+            return
+        
+        elapsed = now - start_time
+        
+        if elapsed >= VISUAL_RAMP_TIME:
+            # Animation complete - snap to target
+            self.vis_current_vals[y, x] = self.vis_anim_to[y, x]
+            # Clear start time to indicate animation done
+            self.vis_anim_start_times[y, x] = 0
+        elif elapsed > 0:
+            # Calculate eased progress (quadratic ease-in-out)
+            progress = min(1.0, elapsed / VISUAL_RAMP_TIME)
+            if progress < 0.5:
+                eased = 2.0 * progress * progress
+            else:
+                eased = 1.0 - ((-2.0 * progress + 2.0) ** 2) / 2.0
+            
+            from_val = self.vis_anim_from[y, x]
+            to_val = self.vis_anim_to[y, x]
+            self.vis_current_vals[y, x] = from_val + (to_val - from_val) * eased
+
     def _process_drones(self, now):
         if not self.app_state.midi_active:
             for drone in self.app_state.drones:
@@ -2432,17 +2501,10 @@ class LavaMIDIApp(ctk.CTk):
 
         threshold = self._get_threshold()
         cw, ch = fw // self.app_state.grid_w, fh // self.app_state.grid_h
-        ramp_speed = dt / VISUAL_RAMP_TIME
 
         # Ensure buffers match grid size
         if self.vis_end_times.shape != (self.app_state.grid_h, self.app_state.grid_w):
             self._reset_buffers()
-
-        # OPTIMIZATION: Use JIT-compiled visual ramp if available
-        if NUMBA_AVAILABLE:
-            self.vis_current_vals = process_visual_ramp(
-                self.vis_current_vals, self.vis_target_vals, ramp_speed
-            )
 
         # Process grid cells
         for y in range(self.app_state.grid_h):
@@ -2468,7 +2530,8 @@ class LavaMIDIApp(ctk.CTk):
                     final_cc = int(min_v + (max_v - min_v) * (current_cc / 127.0))
                     final_cc = max(0, min(127, final_cc))
                     self.midi.send_cc(zone.cc_number, final_cc, zone.channel - 1)
-                    self.vis_target_vals[y, x] = (final_cc / 127.0) * 0.8
+                    new_target = (final_cc / 127.0) * 0.8
+                    self._start_cell_anim(x, y, new_target, now)
                 else:
                     smooth_cd = 0.1 + (zone.smoothing / 100.0) * 1.9 if zone and zone.use_smoothing else COOLDOWN_TIME
                     duration_sec = (zone.duration / 1000.0) if zone else (DEFAULT_NOTE_DURATION_MS / 1000.0)
@@ -2496,39 +2559,23 @@ class LavaMIDIApp(ctk.CTk):
 
                                 self.midi.send_note_on(pitch, vel, zone.channel - 1, duration=duration_sec)
                                 self.vis_end_times[y, x] = now + duration_sec
-                                self.vis_target_vals[y, x] = 0.3 + (0.6 * (vel / 127.0))
+                                new_target = 0.3 + (0.6 * (vel / 127.0))
+                                self._start_cell_anim(x, y, new_target, now)
 
                                 if self.app_state.log_midi_signals:
                                     self._log(f"♪ {zone.name} N{pitch} v{vel}", "midi")
 
                     if zone:
                         if now >= self.vis_end_times[y, x]:
-                            self.vis_target_vals[y, x] = 0.0
+                            self._start_cell_anim(x, y, ZONE_ALPHA, now)
                     else:
                         if speed > threshold:
-                            self.vis_target_vals[y, x] = 0.5
+                            self._start_cell_anim(x, y, 0.5, now)
                         else:
-                            self.vis_target_vals[y, x] = 0.0
+                            self._start_cell_anim(x, y, 0.0, now)
 
-                # Visual logic (non-JIT fallback for ramp)
-                if not NUMBA_AVAILABLE:
-                    target = 0.0
-                    if zone:
-                        target = ZONE_ALPHA
-                        if now < self.vis_end_times[y, x]:
-                            target = max(ZONE_ALPHA, self.vis_target_vals[y, x])
-                    else:
-                        if speed > threshold:
-                            target = 0.5
-                        else:
-                            target = 0.0
-
-                    current = self.vis_current_vals[y, x]
-                    if current < target:
-                        current = min(target, current + ramp_speed)
-                    elif current > target:
-                        current = max(target, current - ramp_speed)
-                    self.vis_current_vals[y, x] = current
+                # Eased visual interpolation
+                self._update_cell_anim(x, y, now)
 
                 # Draw cell
                 x1, y1 = int(x * cw), int(y * ch)
